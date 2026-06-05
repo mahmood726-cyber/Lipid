@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <title>LipidLogic Pro v2.1: Intensification Engine</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@400;700&display=swap" rel="stylesheet">
+  <!-- fonts removed for offline use -->
   <style>
     /* --- Theme: "Athero-Flux" --- */
     :root {
@@ -277,116 +277,8 @@
   </aside>
 </div>
 
-<!-- WORKER: STATISTICAL ENGINE -->
-<script id="worker-code" type="javascript/worker">
-  self.onmessage = function(e) {
-    const { 
-      baselineLDL, // always mg/dL in worker
-      baselineRisk, 
-      strategy, 
-      statinIntolerant,
-      trials,
-      hetPenalty 
-    } = e.data;
-
-    // 1. Calculate Potency
-    let addedPotency = 0;
-    
-    // Potencies defined
-    const potEze = 0.18; // ~18% reduction
-    const potPcsk9 = 0.60; // ~60% reduction
-    
-    if(strategy === 'eze') {
-        addedPotency = potEze;
-    } else if(strategy === 'pcsk9') {
-        addedPotency = potPcsk9;
-    } else if(strategy === 'combo') {
-        // Multiplicative independent action model
-        // Remaining LDL fraction = (1 - Effect1) * (1 - Effect2)
-        // Total Effect = 1 - Remaining
-        addedPotency = 1 - ((1 - potPcsk9) * (1 - potEze)); 
-        // 1 - (0.40 * 0.82) = 1 - 0.328 = 0.672 (67.2%)
-    }
-
-    // Calculate current on-treatment (if on statin) vs New
-    // Assume input Baseline LDL is ON current therapy (Statin) or Naive if intolerant
-    // This is an intensification tool, so Baseline LDL is the starting point.
-    
-    // Final LDL = Baseline * (1 - AddedPotency)
-    const finalLDL = baselineLDL * (1 - addedPotency);
-    const deltaLDL_mg = baselineLDL - finalLDL;
-    const deltaLDL_mmol = deltaLDL_mg * 0.02586;
-
-    // 2. CTT Meta-Analysis Logic
-    // RR = 0.78 per 1 mmol/L reduction (Baigent et al, CTT)
-    // We apply heterogeneity penalty to the efficacy
-    const logRR_per_mmol = Math.log(0.78);
-    // Add noise based on Heterogeneity input
-    const hetFactor = 1 + (hetPenalty/200); // 0% -> 1.0, 100% -> 1.5 spread
-    
-    // 3. Monte Carlo Simulation (N=20,000)
-    const arrValues = [];
-    const rrrValues = [];
-    
-    for(let i=0; i<20000; i++) {
-        // Sample efficacy variation
-        // We simulate uncertainty in the CTT slope
-        let u1=Math.random(), u2=Math.random();
-        let z = Math.sqrt(-2*Math.log(u1)) * Math.cos(2*Math.PI*u2);
-        
-        // SD of logRR roughly 0.03 based on CTT CIs
-        let sampleLogRR = logRR_per_mmol + (z * 0.03 * hetFactor);
-        
-        // Calculate RR for this specific patient's delta
-        let patientRR = Math.exp(sampleLogRR * deltaLDL_mmol);
-        
-        // Cap RR at reasonable limits (e.g. 0.2)
-        patientRR = Math.max(0.2, Math.min(0.99, patientRR));
-        
-        // Calculate ARR
-        // Baseline Risk is 10-year. Scale roughly to 5-year for RCT comparison (linear approx / 2)
-        // Or keep 10-year if user specifies. Let's output 5-Year Horizon for Waffle.
-        let risk5y = baselineRisk / 200; // 20% -> 0.10
-        let arr = risk5y * (1 - patientRR);
-        
-        arrValues.push(arr);
-        rrrValues.push(1 - patientRR);
-    }
-    
-    // Average
-    const meanARR = arrValues.reduce((a,b)=>a+b,0)/arrValues.length;
-    const meanRRR = rrrValues.reduce((a,b)=>a+b,0)/rrrValues.length;
-    
-    // 4. Meta-Analysis Forest Plot Data (Fixed vs Random)
-    // Filter trials based on strategy
-    let activeTrials = [];
-    if(strategy === 'eze') activeTrials = trials.filter(t => t.drug === 'Ezetimibe');
-    else if(strategy === 'pcsk9') activeTrials = trials.filter(t => t.drug === 'PCSK9i');
-    else activeTrials = trials; // Combo shows all
-
-    // 5. Waffle Data
-    // 100 dots. 
-    const n_event_inevitable = Math.round((baselineRisk/2) - (meanARR*100));
-    const n_prevented = Math.round(meanARR * 100);
-    const n_healthy = 100 - n_event_inevitable - n_prevented;
-
-    self.postMessage({
-        type: 'complete',
-        results: {
-            finalLDL,
-            deltaLDL_mg,
-            deltaLDL_mmol,
-            meanARR,
-            meanRRR,
-            n_event_inevitable,
-            n_prevented,
-            n_healthy,
-            activeTrials,
-            strategy
-        }
-    });
-  };
-</script>
+<!-- STATISTICAL ENGINE (pure core, single source of truth) -->
+<script src="engine.js"></script>
 
 <script>
   // --- DATABASE ---
@@ -405,21 +297,6 @@
   };
 
   let lastResult = null;
-
-  // --- WORKER SETUP ---
-  const blob = new Blob([document.getElementById('worker-code').textContent], {type: "text/javascript"});
-  const worker = new Worker(window.URL.createObjectURL(blob));
-
-  worker.onmessage = function(e) {
-    if(e.data.type === 'complete') {
-        lastResult = e.data.results;
-        renderVisuals(lastResult);
-        updateMetrics(lastResult);
-        generateReport(lastResult);
-        document.getElementById('runBtn').classList.remove('processing');
-        document.getElementById('runBtn').disabled = false;
-    }
-  };
 
   // --- INPUT HANDLING ---
   function setUnit(u) {
@@ -474,16 +351,27 @@
 
     const risk = parseFloat(document.getElementById('riskInput').value);
     const het = parseFloat(document.getElementById('hetInput').value);
-    const intolerant = document.getElementById('checkIntolerant').checked;
 
-    worker.postMessage({
+    // Pure-engine Monte-Carlo projection (synchronous; the loop is small).
+    const proj = runProjection({
         baselineLDL: ldl,
         baselineRisk: risk,
         strategy: state.strategy,
-        statinIntolerant: intolerant,
-        trials: TRIALS,
         hetPenalty: het
     });
+
+    // Forest-plot evidence basis: filter the trial DB by the chosen strategy.
+    let activeTrials = [];
+    if (state.strategy === 'eze') activeTrials = TRIALS.filter(t => t.drug === 'Ezetimibe');
+    else if (state.strategy === 'pcsk9') activeTrials = TRIALS.filter(t => t.drug === 'PCSK9i');
+    else activeTrials = TRIALS; // combo shows all
+
+    lastResult = Object.assign({}, proj, { activeTrials: activeTrials });
+    renderVisuals(lastResult);
+    updateMetrics(lastResult);
+    generateReport(lastResult);
+    document.getElementById('runBtn').classList.remove('processing');
+    document.getElementById('runBtn').disabled = false;
   }
 
   // --- RENDERING ---
